@@ -1,5 +1,16 @@
 cec-mqtt-bridge
 ===============
+My take on michaelarnauts' cec-mqtt-bridge.
+
+Differences:
+* active source tracking
+* publishes to mqtt topic based on result of the OSD Name cec command
+* publishes the logical and physical addresses.
+* removes the IR component
+
+I'm currently using this container on a Raspberry Pi 3B+ connected to a receiver to monitor and control a Tv, Receiver, PS4, Nintendo Switch, and Chromecast. 
+HomeAssistant is used to synchronize the Tv and Receiver's power status with the active source.
+
 
 A HDMI-CEC to MQTT bridge written in Python 3 for connecting your AV-devices to your Home Automation system. You can control and monitor power status, volume, and the active source.
 
