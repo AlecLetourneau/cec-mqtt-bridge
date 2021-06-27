@@ -5,32 +5,43 @@ import paho.mqtt.client as mqtt
 import subprocess
 import time
 import re
-import configparser as ConfigParser
 import threading
 import os
 
 # Default configuration
 config = {
     'mqtt': {
-        'broker': 'localhost',
-        'devicename': 'cec-ir-mqtt',
+        'broker': '192.168.1.1',
+        'devicename': 'cec-mqtt',
         'port': 1883,
-        'prefix': 'media',
+        'prefix': 'media/theatre_1',
         'user': os.environ.get('MQTT_USER'),
         'password': os.environ.get('MQTT_PASSWORD'),
         'tls': 0,
     },
     'cec': {
-        'enabled': 0,
         'id': 1,
         'port': 'RPI',
         'devices': '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15',
     },
-    'ir': {
-        'enabled': 0,
-    }
 }
 
+device_names = {'0': 'TV'}
+
+def set_device_name(logical_address, name):
+    logical_address = str(logical_address)
+    for key, value in device_names.items():
+        if value == name and not key == logical_address:
+            del device_names[key]
+    if name == "LivingRoomTv":
+        name = "Chromecast"
+    device_names[logical_address] = name
+    
+def get_device_name(logical_address):
+    return device_names[str(logical_address)]
+
+active_source_id = None
+should_refresh_power_status = False
 
 def mqtt_on_connect(client, userdata, flags, rc):
     """@type client: paho.mqtt.client """
@@ -38,19 +49,12 @@ def mqtt_on_connect(client, userdata, flags, rc):
     print("Connection returned result: " + str(rc))
 
     # Subscribe to CEC commands
-    if int(config['cec']['enabled']) == 1:
-        client.subscribe([
-            (config['mqtt']['prefix'] + '/cec/cmd', 0),
-            (config['mqtt']['prefix'] + '/cec/+/cmd', 0),
-            (config['mqtt']['prefix'] + '/cec/+/set', 0),
-            (config['mqtt']['prefix'] + '/cec/tx', 0)
-        ])
-
-    # Subscribe to IR commands
-    if int(config['ir']['enabled']) == 1:
-        client.subscribe([
-            (config['mqtt']['prefix'] + '/ir/+/tx', 0)
-        ])
+    client.subscribe([
+        (config['mqtt']['prefix'] + '/cec/cmd', 0),
+        (config['mqtt']['prefix'] + '/cec/+/cmd', 0),
+        (config['mqtt']['prefix'] + '/cec/+/set', 0),
+        (config['mqtt']['prefix'] + '/cec/tx', 0)
+    ])
 
     # Publish birth message
     client.publish(config['mqtt']['prefix'] + '/bridge/status', 'online', qos=1, retain=True)
@@ -91,6 +95,10 @@ def mqtt_on_message(client, userdata, message):
                 if action == 'volup':
                     cec_client.VolumeUp()
                     cec_send('71', id=5)
+                    return
+                
+                if action == 'standby':
+                    cec_send('36', id=15)
                     return
 
                 raise Exception("Unknown command (%s)" % action)
@@ -145,25 +153,20 @@ def mqtt_on_message(client, userdata, message):
 
                 if action == 'on':
                     id = int(split[1])
-                    cec_send('44:6D', id=id)
-                    mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), 'on', True)
+                    if id == 0:
+                        cec_send('04', id=id)
+                    else:
+                        cec_send('44:6D', id=id)
+                    should_refresh_power_status = True
                     return
 
-                if action == 'off':
+                if action == 'standby':
                     id = int(split[1])
                     cec_send('36', id=id)
-                    mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), 'off', True)
+                    cec_refresh_power_status()
                     return
 
                 raise Exception("Unknown command (%s)" % action)
-
-        if split[0] == 'ir':
-
-            if split[2] == 'tx':
-                remote = split[1]
-                key = message.payload.decode()
-                ir_send(remote, key)
-                return
 
     except Exception as e:
         print("Error during processing of message: ", message.topic, message.payload, str(e))
@@ -172,63 +175,123 @@ def mqtt_on_message(client, userdata, message):
 def mqtt_send(topic, value, retain=False):
     mqtt_client.publish(topic, value, retain=retain)
 
+def mqtt_send_power_status(id, power):
+    if power == '00':
+        power = 'on'
+        if id == 0:
+            #resend active source
+            pass
+    elif power == '02':
+        power = 'turning on...'
+        cec_refresh_power_status()
+    elif power == '03':
+        power = 'turning off...'
+        cec_refresh_power_status()
+    else:
+        power = 'standby'
+    try:
+        mqtt_send(config['mqtt']['prefix'] + '/cec/' + get_device_name(id) + '/power', power, True)
+    except KeyError as e:
+        cec_request_name(id)
+
 
 def cec_on_message(level, time, message):
-    if level == cec.CEC_LOG_TRAFFIC:
+    # Send raw command to mqtt
+    m = re.search('>> ([0-9a-f:]+)', message)
+    if m:
+        mqtt_send(config['mqtt']['prefix'] + '/cec/rx', m.group(1))
 
-        # Send raw command to mqtt
-        m = re.search('>> ([0-9a-f:]+)', message)
-        if m:
-            mqtt_send(config['mqtt']['prefix'] + '/cec/rx', m.group(1))
+    # Report Power Status
+    m = re.search('>> ([0-9a-f])[0-9a-f]:90:([0-9a-f]{2})', message)
+    if m:
+        id = int(m.group(1), 16)
+        mqtt_send_power_status(id, m.group(2))
+        if not power and id == active_source_id:
+            mqtt_send(config['mqtt']['prefix'] + '/cec/active_source', "none", False)
+            active_source_id = None
+        return
 
-        # Report Power Status
-        m = re.search('>> ([0-9a-f])[0-9a-f]:90:([0-9a-f]{2})', message)
-        if m:
-            id = int(m.group(1), 16)
-            # power = cec_client.PowerStatusToString(int(m.group(2)))
-            if (m.group(2) == '00') or (m.group(2) == '02'):
-                power = 'on'
-            else:
-                power = 'off'
-            mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), power, True)
-            return
+    # Report OSD Name
+    m = re.search('>> ([0-9a-f])[0-9a-f]:47:([0-9a-f]{2}(:[0-9a-f]{2})*)', message)
+    if m:
+        id = int(m.group(1), 16)
+        name =  bytearray.fromhex(m.group(2).replace(':','')).decode()
+        set_device_name(id, name)
+        try:
+            mqtt_send(config['mqtt']['prefix'] + '/cec/' + get_device_name(id) + '/logical_address', id, True)
+        except KeyError as e:
+            cec_request_name(id)
+        cec_interrogate(id)
+        return
 
-        # Device Vendor ID
-        m = re.search('>> ([0-9a-f])[0-9a-f]:87', message)
-        if m:
-            id = int(m.group(1), 16)
-            power = 'on'
-            mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), power, True)
-            return
+    # Device Vendor ID
+    m = re.search('>> ([0-9a-f])[0-9a-f]:87', message)
+    if m:
+        id = int(m.group(1), 16)
+        vendor = bytearray.fromhex(m.group(2).replace(':','')).decode()
+        try:
+            mqtt_send(config['mqtt']['prefix'] + '/cec/' + get_device_name(id) + '/vendor', vendor, True)
+        except KeyError as e:
+            cec_request_name(id)
+        return
 
-        # Report Physical Address
-        m = re.search('>> ([0-9a-f])[0-9a-f]:84', message)
-        if m:
-            id = int(m.group(1), 16)
-            power = 'on'
-            mqtt_send(config['mqtt']['prefix'] + '/cec/' + str(id), power, True)
-            return
+    # Report Physical Address
+    m = re.search('>> ([0-9a-f])[0-9a-f]:84:([0-9a-f]{2}:[0-9a-f]{2})[0-9a-f:]+', message)
+    if m:
+        id = int(m.group(1), 16)
+        address = '.'.join(list(m.group(2).replace(':','')))
+        try:
+            mqtt_send(config['mqtt']['prefix'] + '/cec/' + get_device_name(id) + '/physical_address', address, True)
+        except KeyError as e:
+            cec_request_name(id)
+        return
 
-        # Report Audio Status
-        m = re.search('>> ([0-9a-f])[0-9a-f]:7a:([0-9a-f]{2})', message)
-        if m:
-            volume = None
-            mute = None
+    # Report Audio Status
+    m = re.search('>> ([0-9a-f])[0-9a-f]:7a:([0-9a-f]{2})', message)
+    if m:
+        volume = None
+        mute = None
 
-            audio_status = int(m.group(2), 16)
-            if audio_status <= 100:
-                volume = audio_status
-                mute = 'off'
-            elif audio_status >= 128:
-                volume = audio_status - 128
-                mute = 'on'
+        audio_status = int(m.group(2), 16)
+        if audio_status <= 100:
+            volume = audio_status
+            mute = 'off'
+        elif audio_status >= 128:
+            volume = audio_status - 128
+            mute = 'on'
 
-            if isinstance(volume, int):
-                mqtt_send(config['mqtt']['prefix'] + '/cec/volume', volume, True)
-            if mute:
-                mqtt_send(config['mqtt']['prefix'] + '/cec/mute', mute, True)
-            return
-
+        if isinstance(volume, int):
+            mqtt_send(config['mqtt']['prefix'] + '/cec/volume', volume, False)
+        if mute:
+            mqtt_send(config['mqtt']['prefix'] + '/cec/mute', mute, False)
+        return
+    
+    # Report Active Source
+    m = re.search('>> ([0-9a-f])[0-9a-f]:82:([0-9a-f]{2}:[0-9a-f]{2})', message)
+    if m:
+        active_source_id = int(m.group(1), 16)
+        try:
+            get_device_name(active_source_id)
+        except KeyError as e:
+            cec_request_name(active_source_id)
+            
+        active_source = '.'.join(list(m.group(2).replace(':','')))
+        if active_source == '0.0.0.0':
+            active_source = 'none'
+            active_source_id = None
+        mqtt_send(config['mqtt']['prefix'] + '/cec/active_source', active_source, True)
+        cec_refresh_power_status()
+        return
+    
+        # Report Inactive Source
+    m = re.search('>> ([0-9a-f])[0-9a-f]:9D:([0-9a-f]{2}:[0-9a-f]{2})', message)
+    if m:
+        active_source_id = int(m.group(1), 16)
+        active_source = '.'.join(list(m.group(2).replace(':','')))
+        mqtt_send(config['mqtt']['prefix'] + '/cec/active_source', "none", True)
+        cec_refresh_power_status()
+        return
+        
 
 def cec_volume():
     audio_status = cec_client.AudioStatus()
@@ -244,108 +307,63 @@ def cec_send(cmd, id=None):
     else:
         cec_client.Transmit(cec_client.CommandFromString('1%s:%s' % (hex(id)[2:], cmd)))
 
-
-def ir_listen_thread():
-    try:
-        while True:
-            try:
-                code = lirc.nextcode()
-            except lirc.NextCodeError:
-                code = None
-            if code:
-                code = code[0].split(",", maxsplit=1)
-                if len(code) == 1:
-                    mqtt_send(config['mqtt']['prefix'] + '/ir/rx', code[0].strip())
-                elif len(code) == 2:
-                    remote = code[0].strip()
-                    code = code[1].strip()
-                    mqtt_send(config['mqtt']['prefix'] + '/ir/' + remote + '/rx', code)
-            else:
-                time.sleep(0.2)
-    except:
-        return
-
-
-def ir_send(remote, key):
-    subprocess.call(["irsend", "SEND_ONCE", remote, key])
-
-
-def cec_refresh():
+def cec_refresh_power_status():
+    time.sleep(2)
+    print("Refreshing power status...")
     try:
         for id in config['cec']['devices'].split(','):
-            cec_send('8F', id=int(id))
-
-        cec_send('71', id=5)
+            cec_send('8F', id=int(id)) # Request Power Status
 
     except Exception as e:
         print("Error during refreshing: ", str(e))
+
+def cec_interrogate(id):
+    print("Scanning cec for id: " + str(id))
+    try:
+        cec_send('83', id=int(id)) # Request Physical Address
+        cec_send('8F', id=int(id)) # Request Power Status
+        cec_send('8C', id=int(id))
+    except Exception as e:
+        print("Error during refreshing: ", str(e))
+
+def cec_scan():
+    try:
+        for id in config['cec']['devices'].split(','):
+            cec_request_name(id)
+        cec_send('71', id=5) # Request Mute Status and Volume Level
+        cec_send('85', id=15) # Request Active Source
+
+    except Exception as e:
+        print("Error during refreshing: ", str(e))
+
+def cec_request_name(id):
+    cec_send('46', id=int(id)) # Request OSD Name
 
 
 def cleanup():
     mqtt_client.loop_stop()
     mqtt_client.publish(config['mqtt']['prefix'] + '/bridge/status', 'offline', qos=1, retain=True)
     mqtt_client.disconnect()
-    if int(config['ir']['enabled']) == 1:
-        lirc.deinit()
 
 
 try:
-    ### Parse config ###
-    try:
-        Config = ConfigParser.SafeConfigParser()
-        if Config.read("config.ini"):
-
-            # Load all sections and overwrite default configuration
-            for section in Config.sections():
-                config[section].update(dict(Config.items(section)))
-
-        # Environment variables
-        for section in config:
-            for key, value in config[section].items():
-                env = os.getenv(section.upper() + '_' + key.upper());
-                if env:
-                    config[section][key] = type(value)(env)
-
-        # Do some checks
-        if (not int(config['cec']['enabled']) == 1) and \
-                (not int(config['ir']['enabled']) == 1):
-            raise Exception('IR and CEC are both disabled. Can\'t continue.')
-
-    except Exception as e:
-        print("ERROR: Could not configure:", str(e))
-        exit(1)
-
     ### Setup CEC ###
-    if int(config['cec']['enabled']) == 1:
-        print("Initialising CEC...")
-        try:
-            import cec
+    print("Initialising CEC...")
+    try:
+        import cec
 
-            cec_config = cec.libcec_configuration()
-            cec_config.strDeviceName = "cec-ir-mqtt"
-            cec_config.bActivateSource = 0
-            cec_config.deviceTypes.Add(cec.CEC_DEVICE_TYPE_RECORDING_DEVICE)
-            cec_config.clientVersion = cec.LIBCEC_VERSION_CURRENT
-            cec_config.SetLogCallback(cec_on_message)
-            cec_client = cec.ICECAdapter.Create(cec_config)
-            if not cec_client.Open(config['cec']['port']):
-                raise Exception("Could not connect to cec adapter")
-        except Exception as e:
-            print("ERROR: Could not initialise CEC:", str(e))
-            exit(1)
-
-    ### Setup IR ###
-    if int(config['ir']['enabled']) == 1:
-        print("Initialising IR...")
-        try:
-            import lirc
-
-            lirc.init("cec-ir-mqtt", "lircrc", blocking=False)
-            lirc_thread = threading.Thread(target=ir_listen_thread)
-            lirc_thread.start()
-        except Exception as e:
-            print("ERROR: Could not initialise IR:", str(e))
-            exit(1)
+        cec_config = cec.libcec_configuration()
+        cec_config.strDeviceName = "cec-mqtt"
+        cec_config.bActivateSource = 0
+        cec_config.deviceTypes.Add(cec.CEC_DEVICE_TYPE_RECORDING_DEVICE)
+        cec_config.clientVersion = cec.LIBCEC_VERSION_CURRENT
+        cec_config.SetLogCallback(cec_on_message)
+        cec_client = cec.ICECAdapter.Create(cec_config)
+        if not cec_client.Open(config['cec']['port']):
+            raise Exception("Could not connect to cec adapter")
+    except Exception as e:
+        print("ERROR: Could not initialise CEC:", str(e))
+        exit(1)
 
     ### Setup MQTT ###
     print("Initialising MQTT...")
@@ -359,13 +377,13 @@ try:
     mqtt_client.will_set(config['mqtt']['prefix'] + '/bridge/status', 'offline', qos=1, retain=True)
     mqtt_client.connect(config['mqtt']['broker'], int(config['mqtt']['port']), 60)
     mqtt_client.loop_start()
-
+    
+    cec_scan()
+    cec_interrogate(0)
+            
     print("Starting main loop...")
     while True:
-        if int(config['cec']['enabled']) == 1:
-            cec_refresh()
-        time.sleep(10)
-
+        pass
 except KeyboardInterrupt:
     cleanup()
 

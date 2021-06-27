@@ -1,0 +1,9 @@
+version: "3.9"
+services:
+    cec-mqtt-bridge:
+        container_name: "cec-mqtt-bridge"
+        build: .
+        devices:
+            - "/dev/vchiq"
+        privileged: true
+        restart: "unless-stopped"
