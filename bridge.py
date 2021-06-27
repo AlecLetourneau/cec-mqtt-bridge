@@ -39,6 +39,12 @@ def set_device_name(logical_address, name):
     
 def get_device_name(logical_address):
     return device_names[str(logical_address)]
+    
+def get_logical_address(name):
+    for key, value in device_names.items():
+        if value == name:
+            return key
+    raise Exception("No Address for Name")
 
 active_source_id = None
 should_refresh_power_status = False
@@ -152,7 +158,10 @@ def mqtt_on_message(client, userdata, message):
                 action = message.payload.decode()
 
                 if action == 'on':
-                    id = int(split[1])
+                    try:
+                        id = int(get_logical_address(split[1]))
+                    except:
+                        return
                     if id == 0:
                         cec_send('04', id=id)
                     else:
@@ -161,7 +170,10 @@ def mqtt_on_message(client, userdata, message):
                     return
 
                 if action == 'standby':
-                    id = int(split[1])
+                    try:
+                        id = int(get_logical_address(split[1]))
+                    except:
+                        return
                     cec_send('36', id=id)
                     cec_refresh_power_status()
                     return
