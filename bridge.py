@@ -191,8 +191,7 @@ def mqtt_send_power_status(id, power):
     if power == '00':
         power = 'on'
         if id == 0:
-            #resend active source
-            pass
+            cec_send('85', id=15) # Request Active Source
     elif power == '02':
         power = 'turning on...'
         cec_refresh_power_status()
@@ -286,7 +285,9 @@ def cec_on_message(level, time, message):
             get_device_name(active_source_id)
         except KeyError as e:
             cec_request_name(active_source_id)
-            
+        
+        mqtt_send_power_status(active_source_id, '00')
+        
         active_source = '.'.join(list(m.group(2).replace(':','')))
         if active_source == '0.0.0.0':
             active_source = 'none'
@@ -320,9 +321,12 @@ def cec_send(cmd, id=None):
         cec_client.Transmit(cec_client.CommandFromString('1%s:%s' % (hex(id)[2:], cmd)))
 
 def cec_refresh_power_status():
-    time.sleep(2)
+    time.sleep(4)
     print("Refreshing power status...")
     try:
+        for id in config['cec']['devices'].split(','):
+            cec_send('8F', id=int(id)) # Request Power Status
+        time.sleep(15)
         for id in config['cec']['devices'].split(','):
             cec_send('8F', id=int(id)) # Request Power Status
 
@@ -395,7 +399,8 @@ try:
             
     print("Starting main loop...")
     while True:
-        pass
+        time.sleep(60)
+        cec_refresh_power_status()
 except KeyboardInterrupt:
     cleanup()
 
